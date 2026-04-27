@@ -1,0 +1,1531 @@
+module Main exposing (main)
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Init
+import Node
+import Test.Runner.Effectful exposing ( test, describe, await, awaitError )
+import Sqlite
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Sqlite.Migrate
+import Task
+
+
+{-|-}
+singleMigrationTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+singleMigrationTests fileSystemPermission permissions =
+    let
+        statements =
+            [ "CREATE TABLE foo (id INTEGER)" 
+            ]
+
+        additionalStatements =
+            [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)"
+            , "CREATE TABLE IF NOT EXISTS bar (first TEXT, second TEXT, third TEXT)"
+            ]
+
+        migrations =
+            [ { name = "v1"
+              , statements = statements
+              }
+            ]
+
+        additionalMigration =
+            Array.append
+                [ { name = "v2"
+                  , statements = additionalStatements
+                  }
+                ]
+                migrations
+
+        getAllFromFoo db =
+            Sqlite.getAll db 
+                { query = "SELECT * FROM foo"
+                , parameters = []
+                , rowDecoder =
+                    Sqlite.Decode.Row.column "id" Sqlite.Decode.int (\_ ->
+                        Sqlite.Decode.Row.succeed {}
+                    )
+                }
+    in
+    describe "Tests with a single migration in the migrations array"
+        [ await "Open in-memory database"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "./test.sqlite")))
+                (\db ->
+                    await "Apply single migration"
+                        (Sqlite.Migrate.migrate db permissions additionalMigration)
+                            (\_ ->
+                                describe "Tests after applying the migration"
+                                    [ test "Migration applies successfully"
+                                        (\_ -> Expect.pass)
+                                    , await "Get data from the created table"
+                                        (getAllFromFoo db)
+                                        (\data ->
+                                            test "Expect empty table"
+                                                (\_ ->
+                                                    Expect.equal data []
+                                                )
+                                        )
+                                    , await "Apply single migration again"
+                                        (Sqlite.Migrate.migrate db permissions additionalMigration)
+                                        (\_ ->
+                                            describe "Tests after the migration was applied again" 
+                                                [ test "Migration applies successfully"
+                                                    (\_ -> Expect.pass)
+                                                , await "Get data from the created table"
+                                                    (getAllFromFoo db)
+                                                    (\data ->
+                                                        describe "Tests after getting data from created table"
+                                                            [ test "Expect empty table"
+                                                                (\_ ->
+                                                                    Expect.equal data []
+                                                                )
+                                                            , await "Apply additional migrations"
+                                                                (Sqlite.Migrate.migrate db permissions additionalMigration)
+                                                                (\_ ->
+                                                                    test "Migration succeeds"
+                                                                        (\_ -> Expect.pass)
+                                                                )
+                                                            ]
+                                                    )
+                                                , await "Get migrations from the migrations table"
+                                                    (Sqlite.getAll db getAllMigrationsQuery)
+                                                    (\data ->
+                                                        test "Succeeds"
+                                                            (\_ -> Expect.pass)
+                                                    )
+                                                ]
+                                        )
+                                    ]
+                            )
+                )
+        ]
+
+
+{-|-}
+sqliteErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+sqliteErrorTests fileSystemPermission permissions =
+    let
+        -- First migration is good, but second has a typo. Expected that the 
+        -- migration errors and does not commit changes from the first commit.
+        migrations =
+            [ { name = "first", statements = [ "CREATE TABLE IF NOT EXISTS test (id TEXT)" ] }
+            , { name = "second", statements = [ "CREATE TABEL IF NOT EXISTS test2 (id TEXT)" ] }
+            ]
+    in
+    await "Open database for `sqliteErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrations with invalid SQL"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        describe "Tests after error from invalid SQL in migration"
+                            [ when err is
+                                Sqlite.Migrate.SqliteError (Sqlite.Error string) ->
+                                    test "Produces the correct error with expected error text" 
+                                        (\_ -> 
+                                            Expect.equal True (String.contains "TABEL" string)
+                                        )
+
+                                _ ->
+                                    test "Does not produce the expected error" 
+                                        (\_ -> Expect.fail "")
+                            , awaitError
+                                "Try to get data from the table created in the migration with valid SQL"
+                                (Sqlite.getAll db
+                                    { query = "SELECT * FROM test"
+                                    , parameters = []
+                                    , rowDecoder =
+                                        Sqlite.Decode.Row.column "id" Sqlite.Decode.int (\_ ->
+                                            Sqlite.Decode.Row.succeed {}
+                                        )
+                                    }
+                                )
+                                (\err_ ->
+                                    when err_ is
+                                        Sqlite.Error string ->
+                                            test "The missing table name is in the error message" 
+                                                (\_ -> Expect.equal True (String.contains "test" string)
+                                                )
+                                        
+                                        _ ->
+                                            test "Unexpected error"
+                                                (\_ -> 
+                                                    Expect.fail 
+                                                        "The missing table is not in the error message where it should be"
+                                                )
+                                )
+                            ]
+                    )
+        )
+
+
+{-|-}
+localMigrationsEmptyErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+localMigrationsEmptyErrorTests fileSystemPermission permissions =
+    let
+        migrations =
+            []
+    in
+    await "Open database for `localMigrationsEmptyErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrate with empty migrations array"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        test "Produces the correct error"
+                            (\_ ->
+                                when err is
+                                    Sqlite.Migrate.LocalMigrationsEmptyError ->
+                                        Expect.pass
+
+                                    _ ->
+                                        Expect.fail "Expected LocalMigrationsEmptyError"
+                            )
+                    )
+        )
+
+
+{-|-}
+emptyMigrationNameErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+emptyMigrationNameErrorTests fileSystemPermission permissions =
+    let
+        migrations =
+            [ { name = "", statements = [ "CREATE TABLE IF NOT EXISTS test (id INTEGER)" ] }
+            ]
+    in
+    await "Open database for `emptyMigrationNameErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrate with a migration that has an empty name"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        test "Produces EmptyMigrationNameError"
+                            (\_ -> Expect.equal err Sqlite.Migrate.EmptyMigrationNameError)
+                    )
+                )
+
+
+{-|-}
+conflictingMigrationNameErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+conflictingMigrationNameErrorTests fileSystemPermission permissions =
+    let
+        migrations =
+            [ { name = "duplicate", statements = [ "CREATE TABLE IF NOT EXISTS first (id INTEGER)" ] }
+            , { name = "duplicate", statements = [ "CREATE TABLE IF NOT EXISTS second (id INTEGER)" ] }
+            ]
+    in
+    await "Open database for `conflictingMigrationNameErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrate with duplicate migration names"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        test "Produces ConflictingMigrationNameError"
+                            (\_ ->
+                                when err is
+                                    Sqlite.Migrate.ConflictingMigrationNameError name ->
+                                        Expect.equal name "duplicate"
+
+                                    _ ->
+                                        Expect.fail "Expected ConflictingMigrationNameError"
+                            )
+                    )
+            )
+
+
+{-|-}
+whitespaceMigrationNameErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+whitespaceMigrationNameErrorTests fileSystemPermission permissions =
+    let
+        migrations =
+            [ { name = "   \n\t ", statements = [ "CREATE TABLE IF NOT EXISTS test (id INTEGER)" ] }
+            ]
+    in
+    await "Open database for `whitespaceMigrationNameErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrate with a migration that has a whitespace-only name"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        test "Produces EmptyMigrationNameError"
+                            (\_ -> Expect.equal err Sqlite.Migrate.EmptyMigrationNameError)
+                    )
+            )
+
+
+{-|-}
+whitespaceConflictingMigrationNameErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+whitespaceConflictingMigrationNameErrorTests fileSystemPermission permissions =
+    let
+        migrations =
+            [ { name = "duplicate", statements = [ "CREATE TABLE IF NOT EXISTS first (id INTEGER)" ] }
+            , { name = "  duplicate  ", statements = [ "CREATE TABLE IF NOT EXISTS second (id INTEGER)" ] }
+            ]
+    in
+    await "Open database for `whitespaceConflictingMigrationNameErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Migrate with migration names that differ only by surrounding whitespace"
+                    (Sqlite.Migrate.migrate db permissions migrations)
+                    (\err ->
+                        test "Produces ConflictingMigrationNameError"
+                            (\_ ->
+                                when err is
+                                    Sqlite.Migrate.ConflictingMigrationNameError name ->
+                                        Expect.equal name "duplicate"
+
+                                    _ ->
+                                        Expect.fail "Expected ConflictingMigrationNameError"
+                            )
+                    )
+            )
+
+
+{-|-}
+emptyMigrationStatementsErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+emptyMigrationStatementsErrorTests fileSystemPermission permissions =
+    let
+        emptyArrayMigrations =
+            [ { name = "no statements", statements = [] }
+            ]
+
+        emptyStringMigrations =
+            [ { name = "empty string statement", statements = [ "" ] }
+            ]
+
+        whitespaceStringMigrations =
+            [ { name = "whitespace statement", statements = [ "   \n\t  " ] }
+            ]
+    in
+    describe "EmptyMigrationStatementsError error tests"
+        [ await "Open database for empty statements array"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with a migration that has no statements"
+                        (Sqlite.Migrate.migrate db permissions emptyArrayMigrations)
+                        (\err ->
+                            test "Produces EmptyMigrationStatementsError for empty array"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.EmptyMigrationStatementsError name ->
+                                            Expect.equal name "no statements"
+
+                                        _ ->
+                                            Expect.fail "Expected EmptyMigrationStatementsError"
+                                )
+                        )
+                )
+        , await "Open database for empty string statement"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with a migration whose statement is an empty string"
+                        (Sqlite.Migrate.migrate db permissions emptyStringMigrations)
+                        (\err ->
+                            test "Produces EmptyMigrationStatementsError for empty string"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.EmptyMigrationStatementsError name ->
+                                            Expect.equal name "empty string statement"
+
+                                        _ ->
+                                            Expect.fail "Expected EmptyMigrationStatementsError"
+                                )
+                        )
+                )
+        , await "Open database for whitespace-only statement"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with a migration whose statement is whitespace only"
+                        (Sqlite.Migrate.migrate db permissions whitespaceStringMigrations)
+                        (\err ->
+                            test "Produces EmptyMigrationStatementsError for whitespace-only string"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.EmptyMigrationStatementsError name ->
+                                            Expect.equal name "whitespace statement"
+
+                                        _ ->
+                                            Expect.fail "Expected EmptyMigrationStatementsError"
+                                )
+                        )
+                )
+        ]
+
+
+{-|-}
+migrationStatementMentionsMigrationTableErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrationStatementMentionsMigrationTableErrorTests fileSystemPermission permissions =
+    let
+        directReferenceMigrations =
+            [ { name = "references audit table"
+              , statements = [ "SELECT * FROM __gren_sqlite_migrate" ]
+              }
+            ]
+
+        uppercaseReferenceMigrations =
+            [ { name = "uppercase reference"
+              , statements = [ "SELECT * FROM __GREN_SQLITE_MIGRATE" ]
+              }
+            ]
+
+        embeddedReferenceMigrations =
+            [ { name = "embedded reference"
+              , statements =
+                  [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)"
+                  , "DROP TABLE __gren_sqlite_migrate"
+                  ]
+              }
+            ]
+
+        validSeedMigrations =
+            [ { name = "seed", statements = [ "CREATE TABLE IF NOT EXISTS seed (id INTEGER)" ] }
+            ]
+
+        multiMigrationDropAttempt =
+            [ { name = "seed", statements = [ "CREATE TABLE IF NOT EXISTS seed (id INTEGER)" ] }
+            , { name = "drops audit table"
+              , statements =
+                  [ "CREATE TABLE IF NOT EXISTS bar (id INTEGER)"
+                  , "DROP TABLE __gren_sqlite_migrate"
+                  , "CREATE TABLE IF NOT EXISTS baz (id INTEGER)"
+                  ]
+              }
+            , { name = "trailing"
+              , statements =
+                  [ "CREATE TABLE IF NOT EXISTS qux (id INTEGER)"
+                  , "CREATE TABLE IF NOT EXISTS quux (id INTEGER)"
+                  ]
+              }
+            ]
+    in
+    describe "MigrationStatementMentionsMigrationTableError error tests"
+        [ await "Open database for direct audit table reference"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with a statement that references the audit table"
+                        (Sqlite.Migrate.migrate db permissions directReferenceMigrations)
+                        (\err ->
+                            test "Produces MigrationStatementMentionsMigrationTableError for direct reference"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.MigrationStatementMentionsMigrationTableError name ->
+                                            Expect.equal name "references audit table"
+
+                                        _ ->
+                                            Expect.fail "Expected MigrationStatementMentionsMigrationTableError"
+                                )
+                        )
+                )
+        , await "Open database for uppercase audit table reference"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with an uppercase reference to the audit table"
+                        (Sqlite.Migrate.migrate db permissions uppercaseReferenceMigrations)
+                        (\err ->
+                            test "Produces MigrationStatementMentionsMigrationTableError for uppercase reference"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.MigrationStatementMentionsMigrationTableError name ->
+                                            Expect.equal name "uppercase reference"
+
+                                        _ ->
+                                            Expect.fail "Expected MigrationStatementMentionsMigrationTableError"
+                                )
+                        )
+                )
+        , await "Open database for audit table reference embedded among valid statements"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    awaitError "Migrate with an audit table reference among other statements"
+                        (Sqlite.Migrate.migrate db permissions embeddedReferenceMigrations)
+                        (\err ->
+                            test "Produces MigrationStatementMentionsMigrationTableError for embedded reference"
+                                (\_ ->
+                                    when err is
+                                        Sqlite.Migrate.MigrationStatementMentionsMigrationTableError name ->
+                                            Expect.equal name "embedded reference"
+
+                                        _ ->
+                                            Expect.fail "Expected MigrationStatementMentionsMigrationTableError"
+                                )
+                        )
+                )
+        , await "Open database for multi-migration drop attempt"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Seed audit table with a successful migration"
+                        (Sqlite.Migrate.migrate db permissions validSeedMigrations)
+                        (\_ ->
+                            awaitError "Migrate with multiple migrations where one tries to drop the audit table"
+                                (Sqlite.Migrate.migrate db permissions multiMigrationDropAttempt)
+                                (\err ->
+                                    describe "After the failed drop attempt"
+                                        [ test "Produces MigrationStatementMentionsMigrationTableError naming the offending migration"
+                                            (\_ ->
+                                                when err is
+                                                    Sqlite.Migrate.MigrationStatementMentionsMigrationTableError name ->
+                                                        Expect.equal name "drops audit table"
+
+                                                    _ ->
+                                                        Expect.fail "Expected MigrationStatementMentionsMigrationTableError"
+                                            )
+                                        , await "Query the audit table to confirm it still exists"
+                                            (Sqlite.getAll db getAllMigrationsQuery)
+                                            (\rows ->
+                                                describe "Audit table state after failed drop"
+                                                    [ test "Audit table still exists and is queryable"
+                                                        (\_ -> Expect.pass)
+                                                    , test "Only the originally-applied seed migration remains"
+                                                        (\_ ->
+                                                            Expect.equal
+                                                                (Array.map .name rows)
+                                                                [ "seed" ]
+                                                        )
+                                                    ]
+                                            )
+                                        ]
+                                )
+                        )
+                )
+        ]
+
+
+{-|-}
+moreRemoteThanLocalMigrationsErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+moreRemoteThanLocalMigrationsErrorTests fileSystemPermission permissions =
+    let
+        twoMigrations =
+            [ { name = "first", statements = [ "CREATE TABLE IF NOT EXISTS first (id INTEGER)" ] }
+            , { name = "second", statements = [ "CREATE TABLE IF NOT EXISTS second (id INTEGER)" ] }
+            ]
+
+        oneMigration =
+            [ { name = "first", statements = [ "CREATE TABLE IF NOT EXISTS first (id INTEGER)" ] }
+            ]
+    in
+    await "Open database for `moreRemoteThanLocalMigrationsErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply two migrations successfully"
+                    (Sqlite.Migrate.migrate db permissions twoMigrations)
+                    (\_ ->
+                        awaitError "Re-run migration with fewer local migrations than remote"
+                            (Sqlite.Migrate.migrate db permissions oneMigration)
+                            (\err ->
+                                test "Produces the correct error"
+                                    (\_ ->
+                                        when err is
+                                            Sqlite.Migrate.MoreRemoteThanLocalMigrationsError ->
+                                                Expect.pass
+
+                                            _ ->
+                                                Expect.fail "Expected MoreRemoteThanLocalMigrationsError"
+                                    )
+                            )
+                    )
+        )
+
+
+{-|-}
+migrationChainDivergedErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrationChainDivergedErrorTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1", statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ] }
+
+        v1Edited =
+            { name = "v1", statements = [ "CREATE TABLE IF NOT EXISTS foo_edited (id INTEGER)" ] }
+
+        v2 =
+            { name = "v2", statements = [ "CREATE TABLE IF NOT EXISTS bar (id INTEGER)" ] }
+
+        v2Edited =
+            { name = "v2", statements = [ "CREATE TABLE IF NOT EXISTS bar_edited (id INTEGER)" ] }
+
+        v3 =
+            { name = "v3", statements = [ "CREATE TABLE IF NOT EXISTS baz (id INTEGER)" ] }
+    in
+    describe "MigrationChainDivergedError error tests"
+        [ await "Open database for first-migration content change"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ v1 ])
+                        (\_ ->
+                            awaitError "Re-run with v1's statements changed"
+                                (Sqlite.Migrate.migrate db permissions [ v1Edited ])
+                                (\err ->
+                                    test "Produces MigrationChainDivergedError naming v1"
+                                        (\_ ->
+                                            when err is
+                                                Sqlite.Migrate.MigrationChainDivergedError name ->
+                                                    Expect.equal name "v1"
+
+                                                _ ->
+                                                    Expect.fail "Expected MigrationChainDivergedError"
+                                        )
+                                )
+                        )
+                )
+        , await "Open database for middle-migration content change with appended migration"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1, v2] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                        (\_ ->
+                            awaitError "Re-run with v2 edited and v3 appended"
+                                (Sqlite.Migrate.migrate db permissions [ v1, v2Edited, v3 ])
+                                (\err ->
+                                    test "Produces MigrationChainDivergedError naming v2 (the first divergence)"
+                                        (\_ ->
+                                            when err is
+                                                Sqlite.Migrate.MigrationChainDivergedError name ->
+                                                    Expect.equal name "v2"
+
+                                                _ ->
+                                                    Expect.fail "Expected MigrationChainDivergedError"
+                                        )
+                                )
+                        )
+                )
+        , await "Open database for migration reordering"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1, v2] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                        (\_ ->
+                            awaitError "Re-run with v3 inserted between v1 and v2"
+                                (Sqlite.Migrate.migrate db permissions [ v1, v3, v2 ])
+                                (\err ->
+                                    test "Produces MigrationChainDivergedError naming v3 (the divergence point)"
+                                        (\_ ->
+                                            when err is
+                                                Sqlite.Migrate.MigrationChainDivergedError name ->
+                                                    Expect.equal name "v3"
+
+                                                _ ->
+                                                    Expect.fail "Expected MigrationChainDivergedError"
+                                        )
+                                )
+                        )
+                )
+        , await "Open database for same-length divergence"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1, v2] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                        (\_ ->
+                            awaitError "Re-run with v2's statements changed (same length as remote)"
+                                (Sqlite.Migrate.migrate db permissions [ v1, v2Edited ])
+                                (\err ->
+                                    test "Produces MigrationChainDivergedError, not MoreRemoteThanLocalMigrationsError"
+                                        (\_ ->
+                                            when err is
+                                                Sqlite.Migrate.MigrationChainDivergedError name ->
+                                                    Expect.equal name "v2"
+
+                                                _ ->
+                                                    Expect.fail "Expected MigrationChainDivergedError"
+                                        )
+                                )
+                        )
+                )
+        ]
+
+
+{-|-}
+migrationHashesDoNotMatchErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrationHashesDoNotMatchErrorTests fileSystemPermission permissions =
+    let
+        migration =
+            { name = "v1", statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ] }
+
+        -- Tampers with `migration_hash` while leaving `chain_hash` intact, so the
+        -- chain-hash lookup still succeeds but the per-migration hash comparison fails.
+        -- 'AAAA' is valid base64 (decodes to three zero bytes) so it slips past the
+        -- corruption check that runs before this branch is reached.
+        tamperMigrationHash =
+            { statement = "UPDATE __gren_sqlite_migrate SET migration_hash = 'AAAA' WHERE name = 'v1'"
+            , parameters = []
+            }
+    in
+    await "Open database for `migrationHashesDoNotMatchErrorTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ migration ])
+                    (\_ ->
+                        await "Tamper with migration_hash in audit table"
+                            (Sqlite.execute db tamperMigrationHash)
+                            (\_ ->
+                                awaitError "Re-run migrate after tampering"
+                                    (Sqlite.Migrate.migrate db permissions [ migration ])
+                                    (\err ->
+                                        test "Produces MigrationHashesDoNotMatchError naming v1"
+                                            (\_ ->
+                                                when err is
+                                                    Sqlite.Migrate.MigrationHashesDoNotMatchError name ->
+                                                        Expect.equal name "v1"
+
+                                                    _ ->
+                                                        Expect.fail "Expected MigrationHashesDoNotMatchError"
+                                            )
+                                    )
+                            )
+                    )
+            )
+
+
+{-|-}
+migrationHashDecodingFailedErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrationHashDecodingFailedErrorTests fileSystemPermission permissions =
+    let
+        migration =
+            { name = "v1", statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ] }
+
+        tamperChainHash =
+            { statement = "UPDATE __gren_sqlite_migrate SET chain_hash = '!!!invalid!!!' WHERE name = 'v1'"
+            , parameters = []
+            }
+
+        tamperMigrationHash =
+            { statement = "UPDATE __gren_sqlite_migrate SET migration_hash = '!!!invalid!!!' WHERE name = 'v1'"
+            , parameters = []
+            }
+    in
+    describe "MigrationHashDecodingFailedError error tests"
+        [ await "Open database for chain_hash corruption"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ migration ])
+                        (\_ ->
+                            await "Corrupt chain_hash in audit table"
+                                (Sqlite.execute db tamperChainHash)
+                                (\_ ->
+                                    awaitError "Re-run migrate after corrupting chain_hash"
+                                        (Sqlite.Migrate.migrate db permissions [ migration ])
+                                        (\err ->
+                                            test "Produces MigrationHashDecodingFailedError"
+                                                (\_ ->
+                                                    Expect.equal err Sqlite.Migrate.MigrationHashDecodingFailedError
+                                                )
+                                        )
+                                )
+                        )
+                )
+        , await "Open database for migration_hash corruption"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+                (\db ->
+                    await "Apply [v1] successfully"
+                        (Sqlite.Migrate.migrate db permissions [ migration ])
+                        (\_ ->
+                            await "Corrupt migration_hash in audit table"
+                                (Sqlite.execute db tamperMigrationHash)
+                                (\_ ->
+                                    awaitError "Re-run migrate after corrupting migration_hash"
+                                        (Sqlite.Migrate.migrate db permissions [ migration ])
+                                        (\err ->
+                                            test "Produces MigrationHashDecodingFailedError"
+                                                (\_ ->
+                                                    Expect.equal err Sqlite.Migrate.MigrationHashDecodingFailedError
+                                                )
+                                        )
+                                )
+                        )
+                )
+        ]
+
+
+{-| When a migration in the middle of a `migrate` call fails, every prior
+statement from the same call must be undone and the audit table must be
+left untouched.
+-}
+rollbackOnFailureTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+rollbackOnFailureTests fileSystemPermission permissions =
+    let
+        seed =
+            { name = "seed"
+            , statements = [ "CREATE TABLE IF NOT EXISTS seed_table (id INTEGER)" ]
+            }
+
+        -- The second statement has an intentional `CREATE TABEL` typo, so the
+        -- first statement of this migration also needs to be rolled back.
+        secondAndBroken =
+            { name = "second_and_broken"
+            , statements =
+                [ "CREATE TABLE IF NOT EXISTS second_table (id INTEGER)"
+                , "CREATE TABEL invalid (id INTEGER)"
+                ]
+            }
+
+        querySecondTable =
+            { query = "SELECT id FROM second_table"
+            , parameters = []
+            , rowDecoder =
+                Sqlite.Decode.Row.column "id" Sqlite.Decode.int (\_ -> Sqlite.Decode.Row.succeed {})
+            }
+    in
+    await "Open database for `rollbackOnFailureTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply seed migration successfully"
+                    (Sqlite.Migrate.migrate db permissions [ seed ])
+                    (\_ ->
+                        awaitError "Run [seed, secondAndBroken] - expect failure"
+                            (Sqlite.Migrate.migrate db permissions [ seed, secondAndBroken ])
+                            (\_ ->
+                                describe "After the failed migration"
+                                    [ await "Query the audit table"
+                                        (Sqlite.getAll db getAllMigrationsQuery)
+                                        (\rows ->
+                                            test "Audit table contains only the seed migration"
+                                                (\_ ->
+                                                    Expect.equal
+                                                        (Array.map .name rows)
+                                                        [ "seed" ]
+                                                )
+                                        )
+                                    , awaitError "Query second_table - expect it does not exist"
+                                        (Sqlite.getAll db querySecondTable)
+                                        (\err ->
+                                            test "second_table's CREATE was rolled back"
+                                                (\_ ->
+                                                    when err is
+                                                        Sqlite.Error msg ->
+                                                            if String.contains "second_table" msg then
+                                                                Expect.pass
+
+                                                            else
+                                                                Expect.fail ("Expected error mentioning second_table, got: " ++ msg)
+
+                                                        _ ->
+                                                            Expect.fail "Expected GenericError for missing table"
+                                                )
+                                        )
+                                    ]
+                            )
+                    )
+            )
+
+
+{-| Re-running `migrate` with the same input must not re-execute statements
+or change the audit table. v1's statement intentionally omits `IF NOT EXISTS`
+so any re-execution would error and fail the test.
+-}
+rerunIsNoOpTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+rerunIsNoOpTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE foo (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE bar (id INTEGER)" ]
+            }
+
+        insertIntoFoo =
+            { statement = "INSERT INTO foo (id) VALUES (1)"
+            , parameters = []
+            }
+
+        queryFoo =
+            { query = "SELECT id FROM foo"
+            , parameters = []
+            , rowDecoder =
+                Sqlite.Decode.Row.column "id" Sqlite.Decode.int (\id -> Sqlite.Decode.Row.succeed { id = id })
+            }
+    in
+    await "Open database for `rerunIsNoOpTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1, v2] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                    (\_ ->
+                        await "Snapshot audit table after first run"
+                            (Sqlite.getAll db getAllMigrationsQuery)
+                            (\firstSnapshot ->
+                                await "Insert a row into foo to detect statement re-execution"
+                                    (Sqlite.execute db insertIntoFoo)
+                                    (\_ ->
+                                        await "Re-run [v1, v2]"
+                                            (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                                            (\_ ->
+                                                describe "After the no-op re-run"
+                                                    [ await "Snapshot audit table after second run"
+                                                        (Sqlite.getAll db getAllMigrationsQuery)
+                                                        (\secondSnapshot ->
+                                                            test "Audit table is unchanged across re-run"
+                                                                (\_ -> Expect.equal firstSnapshot secondSnapshot)
+                                                        )
+                                                    , await "Query foo to confirm user data survived"
+                                                        (Sqlite.getAll db queryFoo)
+                                                        (\rows ->
+                                                            test "Inserted row is still in foo (statements not re-executed)"
+                                                                (\_ -> Expect.equal (Array.length rows) 1)
+                                                        )
+                                                    ]
+                                            )
+                                    )
+                            )
+                    )
+            )
+
+
+{-| Cosmetic differences in a statement's whitespace and line endings must
+not change the chain hash. Re-running with the statement reformatted
+exercises all three branches of `normalizeStatementForHashing`: leading
+whitespace, trailing whitespace, and CRLF line endings.
+-}
+whitespaceInStatementsIgnoredTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+whitespaceInStatementsIgnoredTests fileSystemPermission permissions =
+    let
+        original =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ]
+            }
+
+        reformatted =
+            { name = "v1"
+            , statements = [ "  \r\nCREATE TABLE IF NOT EXISTS foo (id INTEGER)\r\n  " ]
+            }
+    in
+    await "Open database for `whitespaceInStatementsIgnoredTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply original v1"
+                    (Sqlite.Migrate.migrate db permissions [ original ])
+                    (\_ ->
+                        await "Snapshot audit table"
+                            (Sqlite.getAll db getAllMigrationsQuery)
+                            (\firstSnapshot ->
+                                await "Re-run with reformatted v1 (CRLF + surrounding whitespace)"
+                                    (Sqlite.Migrate.migrate db permissions [ reformatted ])
+                                    (\_ ->
+                                        await "Snapshot audit table after reformatted re-run"
+                                            (Sqlite.getAll db getAllMigrationsQuery)
+                                            (\secondSnapshot ->
+                                                test "Audit table is unchanged - reformatting did not alter the hash"
+                                                    (\_ -> Expect.equal firstSnapshot secondSnapshot)
+                                            )
+                                    )
+                            )
+                    )
+            )
+
+
+{-| State written by `migrate` must survive closing and re-opening the
+database file. Applies [v1, v2] in one session, then re-opens and applies
+[v1, v2, v3] in a second session, asserting that v1 and v2 are recognised
+as already-applied and only v3 is appended.
+-}
+survivesDatabaseReopenTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+survivesDatabaseReopenTests fileSystemPermission permissions =
+    let
+        path =
+            FileSystem.Path.fromPosixString "./test_reopen.sqlite"
+
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS reopen_a (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE IF NOT EXISTS reopen_b (id INTEGER)" ]
+            }
+
+        v3 =
+            { name = "v3"
+            , statements = [ "CREATE TABLE IF NOT EXISTS reopen_c (id INTEGER)" ]
+            }
+
+        -- Best-effort delete of any pre-existing file so the test starts clean.
+        cleanupThenOpen =
+            FileSystem.remove fileSystemPermission { recursive = False } path
+                |> Task.onError (\_ -> Task.succeed path)
+                |> Task.andThen (\_ -> Sqlite.open fileSystemPermission Sqlite.defaultOptions (Sqlite.File path))
+    in
+    await "Open fresh on-disk database"
+        cleanupThenOpen
+            (\firstDb ->
+                await "Apply [v1, v2] in first session"
+                    (Sqlite.Migrate.migrate firstDb permissions [ v1, v2 ])
+                    (\_ ->
+                        await "Snapshot audit table from first session"
+                            (Sqlite.getAll firstDb getAllMigrationsQuery)
+                            (\firstSnapshot ->
+                                await "Close first session"
+                                    (Sqlite.close firstDb)
+                                    (\_ ->
+                                        await "Re-open the same on-disk database"
+                                            (Sqlite.open fileSystemPermission Sqlite.defaultOptions (Sqlite.File path))
+                                            (\secondDb ->
+                                                await "Apply [v1, v2, v3] in second session"
+                                                    (Sqlite.Migrate.migrate secondDb permissions [ v1, v2, v3 ])
+                                                    (\_ ->
+                                                        await "Snapshot audit table from second session"
+                                                            (Sqlite.getAll secondDb getAllMigrationsQuery)
+                                                            (\secondSnapshot ->
+                                                                describe "After the reopen and v3 application"
+                                                                    [ test "Second session sees three migrations"
+                                                                        (\_ ->
+                                                                            Expect.equal
+                                                                                (Array.map .name secondSnapshot)
+                                                                                [ "v1", "v2", "v3" ]
+                                                                        )
+                                                                    , test "v1 and v2 rows are unchanged from the first session"
+                                                                        (\_ ->
+                                                                            Expect.equal
+                                                                                firstSnapshot
+                                                                                (Array.takeFirst 2 secondSnapshot)
+                                                                        )
+                                                                    ]
+                                                            )
+                                                    )
+                                            )
+                                    )
+                            )
+                    )
+            )
+
+
+{-| Pending migrations must apply in declaration order. The three
+migrations form a structural DDL chain: v2's `ALTER TABLE` requires v1's
+table, and v3's `CREATE UNIQUE INDEX` requires v2's column — so the call
+only succeeds if the apply pipeline runs them in declared order.
+-}
+migrationsApplyInDeclarationOrderTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrationsApplyInDeclarationOrderTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE users (id INTEGER PRIMARY KEY)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "ALTER TABLE users ADD COLUMN email TEXT" ]
+            }
+
+        v3 =
+            { name = "v3"
+            , statements = [ "CREATE UNIQUE INDEX users_email_idx ON users (email)" ]
+            }
+    in
+    await "Open database for `migrationsApplyInDeclarationOrderTests`"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1, v2, v3] - succeeds only if applied in order"
+                    (Sqlite.Migrate.migrate db permissions [ v1, v2, v3 ])
+                    (\_ ->
+                        await "Query the audit table"
+                            (Sqlite.getAll db getAllMigrationsQuery)
+                            (\auditRows ->
+                                test "Audit table records v1, v2, v3 in declaration order"
+                                    (\_ ->
+                                        Expect.equal
+                                            (Array.map .name auditRows)
+                                            [ "v1", "v2", "v3" ]
+                                    )
+                            )
+                    )
+            )
+
+
+{-| Preview against an empty database returns the full pending list and does
+not create the migrations table (the savepoint is always rolled back).
+-}
+previewFreshDatabaseTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewFreshDatabaseTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE IF NOT EXISTS bar (id INTEGER)" ]
+            }
+    in
+    await "Open database for fresh-database preview"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Preview [v1, v2] against an empty database"
+                    (Sqlite.Migrate.preview db permissions [ v1, v2 ])
+                    (\result ->
+                        awaitError "Query the migrations table after preview"
+                            (Sqlite.getAll db getAllMigrationsQuery)
+                            (\queryErr ->
+                                describe "After previewing on an empty database"
+                                    [ test "The migrations table was not created (preview rolled back)"
+                                        (\_ ->
+                                            when queryErr is
+                                                Sqlite.Error msg ->
+                                                    if String.contains "__gren_sqlite_migrate" msg then
+                                                        Expect.pass
+
+                                                    else
+                                                        Expect.fail ("Expected error mentioning the migrations table, got: " ++ msg)
+
+                                                _ ->
+                                                    Expect.fail "Expected GenericError for missing migrations table"
+                                        )
+                                    ]
+                            )
+                    )
+            )
+
+
+{-| Preview after applying one migration splits the result into an `applied`
+side and a `pending` side.
+-}
+previewWithOneAppliedTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewWithOneAppliedTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE IF NOT EXISTS bar (id INTEGER)" ]
+            }
+    in
+    await "Open database for migrate-then-preview"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ v1 ])
+                    (\_ ->
+                        await "Preview [v1, v2] after applying [v1]"
+                            (Sqlite.Migrate.preview db permissions [ v1, v2 ])
+                            (\result ->
+                                describe "Preview splits migrations into applied and pending"
+                                    [ test "v1 is reported as applied"
+                                        (\_ ->
+                                            Expect.equal
+                                                (Array.map .name result.applied)
+                                                [ "v1" ]
+                                        )
+                                    , test "v2 is reported as pending"
+                                        (\_ ->
+                                            Expect.equal
+                                                (Array.map .name result.pending)
+                                                [ "v2" ]
+                                        )
+                                    ]
+                            )
+                    )
+            )
+
+
+{-| `preview` must report already-applied migrations in application order,
+not in key order. Applying [v1, v2] then previewing [v1, v2, v3] must list
+`applied` as ["v1", "v2"] in that order.
+-}
+previewAppliedOrderTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewAppliedOrderTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS order_a (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE IF NOT EXISTS order_b (id INTEGER)" ]
+            }
+
+        v3 =
+            { name = "v3"
+            , statements = [ "CREATE TABLE IF NOT EXISTS order_c (id INTEGER)" ]
+            }
+    in
+    await "Open database for preview-applied-order test"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1, v2] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ v1, v2 ])
+                    (\_ ->
+                        await "Preview [v1, v2, v3]"
+                            (Sqlite.Migrate.preview db permissions [ v1, v2, v3 ])
+                            (\result ->
+                                describe "Preview lists applied migrations in application order"
+                                    [ test "applied is ordered [v1, v2]"
+                                        (\_ ->
+                                            Expect.equal
+                                                (Array.map .name result.applied)
+                                                [ "v1", "v2" ]
+                                        )
+                                    , test "pending is ordered [v3]"
+                                        (\_ ->
+                                            Expect.equal
+                                                (Array.map .name result.pending)
+                                                [ "v3" ]
+                                        )
+                                    ]
+                            )
+                    )
+            )
+
+
+{-| Preview against a database that already has applied migrations does not
+modify the audit table — snapshots taken before and after must match.
+-}
+previewLeavesStateUnchangedTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewLeavesStateUnchangedTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ]
+            }
+
+        v2 =
+            { name = "v2"
+            , statements = [ "CREATE TABLE IF NOT EXISTS bar (id INTEGER)" ]
+            }
+    in
+    await "Open database for preview-leaves-state-unchanged test"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ v1 ])
+                    (\_ ->
+                        await "Snapshot the migrations table before preview"
+                            (Sqlite.getAll db getAllMigrationsQuery)
+                            (\beforeSnapshot ->
+                                await "Preview [v1, v2]"
+                                    (Sqlite.Migrate.preview db permissions [ v1, v2 ])
+                                    (\_ ->
+                                        await "Snapshot the migrations table after preview"
+                                            (Sqlite.getAll db getAllMigrationsQuery)
+                                            (\afterSnapshot ->
+                                                test "The migrations table is unchanged after preview"
+                                                    (\_ -> Expect.equal beforeSnapshot afterSnapshot)
+                                            )
+                                    )
+                            )
+                    )
+            )
+
+
+{-| Preview surfaces the same `MigrationChainDivergedError` that `migrate`
+would, when a previously-applied migration's statements have changed.
+-}
+previewSurfacesDivergedChainErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewSurfacesDivergedChainErrorTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo (id INTEGER)" ]
+            }
+
+        v1Edited =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS foo_edited (id INTEGER)" ]
+            }
+    in
+    await "Open database for preview-with-diverged-chain test"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Apply [v1] successfully"
+                    (Sqlite.Migrate.migrate db permissions [ v1 ])
+                    (\_ ->
+                        awaitError "Preview with v1's statements changed"
+                            (Sqlite.Migrate.preview db permissions [ v1Edited ])
+                            (\err ->
+                                test "Produces MigrationChainDivergedError naming v1"
+                                    (\_ ->
+                                        when err is
+                                            Sqlite.Migrate.MigrationChainDivergedError name ->
+                                                Expect.equal name "v1"
+
+                                            _ ->
+                                                Expect.fail "Expected MigrationChainDivergedError"
+                                    )
+                            )
+                    )
+            )
+
+
+{-| Preview with no local migrations fails with `LocalMigrationsEmptyError`,
+the same error `migrate` would produce.
+-}
+previewWithEmptyMigrationsErrorTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewWithEmptyMigrationsErrorTests fileSystemPermission permissions =
+    await "Open database for preview-with-empty-migrations test"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                awaitError "Preview with no migrations"
+                    (Sqlite.Migrate.preview db permissions [])
+                    (\err ->
+                        test "Produces LocalMigrationsEmptyError"
+                            (\_ ->
+                                Expect.equal err Sqlite.Migrate.LocalMigrationsEmptyError
+                            )
+                    )
+            )
+
+
+{-| `migrate` runs inside a savepoint, so it composes with a caller-owned
+transaction: a caller `ROLLBACK` discards the migration work instead of it
+committing independently, and a caller `COMMIT` keeps it.
+-}
+migrateInsideCallerTransactionTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+migrateInsideCallerTransactionTests fileSystemPermission permissions =
+    let
+        migrations =
+            [ { name = "v1"
+              , statements = [ "CREATE TABLE IF NOT EXISTS caller_tx (id INTEGER)" ]
+              }
+            ]
+
+        queryCallerTx =
+            { query = "SELECT id FROM caller_tx"
+            , parameters = []
+            , rowDecoder =
+                Sqlite.Decode.Row.column "id" Sqlite.Decode.int (\_ -> Sqlite.Decode.Row.succeed {})
+            }
+    in
+    describe "migrate inside a caller-owned transaction"
+        [ await "Open database for the caller-rollback scenario"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Begin a caller transaction"
+                    (Sqlite.executeScript db "BEGIN TRANSACTION")
+                    (\_ ->
+                        await "Run migrate inside the caller transaction"
+                            (Sqlite.Migrate.migrate db permissions migrations)
+                            (\_ ->
+                                await "Caller ROLLBACKs its transaction"
+                                    (Sqlite.executeScript db "ROLLBACK")
+                                    (\_ ->
+                                        describe "After the caller rolled back"
+                                            [ awaitError "Query caller_tx - expect it does not exist"
+                                                (Sqlite.getAll db queryCallerTx)
+                                                (\err ->
+                                                    test "The migration's table was discarded with the caller transaction"
+                                                        (\_ ->
+                                                            when err is
+                                                                Sqlite.Error msg ->
+                                                                    Expect.equal
+                                                                        True
+                                                                        (String.contains "caller_tx" msg)
+
+                                                                _ ->
+                                                                    Expect.fail "Expected GenericError for missing table"
+                                                        )
+                                                )
+                                            , awaitError "Query the migrations table - expect it does not exist"
+                                                (Sqlite.getAll db getAllMigrationsQuery)
+                                                (\err ->
+                                                    test "The migrations table was discarded with the caller transaction"
+                                                        (\_ ->
+                                                            when err is
+                                                                Sqlite.Error msg ->
+                                                                    Expect.equal
+                                                                        True
+                                                                        (String.contains "__gren_sqlite_migrate" msg)
+
+                                                                _ ->
+                                                                    Expect.fail "Expected GenericError for missing migrations table"
+                                                        )
+                                                )
+                                            ]
+                                    )
+                            )
+                    )
+            )
+        , await "Open database for the caller-commit scenario"
+            (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Begin a caller transaction"
+                    (Sqlite.executeScript db "BEGIN TRANSACTION")
+                    (\_ ->
+                        await "Run migrate inside the caller transaction"
+                            (Sqlite.Migrate.migrate db permissions migrations)
+                            (\_ ->
+                                await "Caller COMMITs its transaction"
+                                    (Sqlite.executeScript db "COMMIT")
+                                    (\_ ->
+                                        describe "After the caller committed"
+                                            [ await "Query the migrations table"
+                                                (Sqlite.getAll db getAllMigrationsQuery)
+                                                (\rows ->
+                                                    test "The migration was recorded by the caller COMMIT"
+                                                        (\_ ->
+                                                            Expect.equal
+                                                                (Array.map .name rows)
+                                                                [ "v1" ]
+                                                        )
+                                                )
+                                            , await "Query caller_tx"
+                                                (Sqlite.getAll db queryCallerTx)
+                                                (\rows ->
+                                                    test "The migration's table was kept by the caller COMMIT"
+                                                        (\_ -> Expect.equal rows [])
+                                                )
+                                            ]
+                                    )
+                            )
+                    )
+            )
+        ]
+
+
+{-| `preview` also composes with a caller-owned transaction: it reports what
+would happen without committing anything, and the caller can still `ROLLBACK`
+afterwards, proving the savepoint did not end the caller's transaction early.
+-}
+previewInsideCallerTransactionTests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+previewInsideCallerTransactionTests fileSystemPermission permissions =
+    let
+        v1 =
+            { name = "v1"
+            , statements = [ "CREATE TABLE IF NOT EXISTS preview_tx (id INTEGER)" ]
+            }
+    in
+    await "Open database for preview-inside-caller-transaction tests"
+        (Sqlite.open fileSystemPermission Sqlite.defaultOptions Sqlite.Memory)
+            (\db ->
+                await "Begin a caller transaction"
+                    (Sqlite.executeScript db "BEGIN TRANSACTION")
+                    (\_ ->
+                        await "Preview inside the caller transaction"
+                            (Sqlite.Migrate.preview db permissions [ v1 ])
+                            (\result ->
+                                describe "After previewing inside the caller transaction"
+                                    [ test "v1 is reported as pending"
+                                        (\_ ->
+                                            Expect.equal
+                                                (Array.map .name result.pending)
+                                                [ "v1" ]
+                                        )
+                                    , await "Caller ROLLBACKs its transaction"
+                                        (Sqlite.executeScript db "ROLLBACK")
+                                        (\_ ->
+                                            awaitError "Query the migrations table - expect it does not exist"
+                                                (Sqlite.getAll db getAllMigrationsQuery)
+                                                (\err ->
+                                                    test "Preview left nothing behind in the caller transaction"
+                                                        (\_ ->
+                                                            when err is
+                                                                Sqlite.Error msg ->
+                                                                    Expect.equal
+                                                                        True
+                                                                        (String.contains "__gren_sqlite_migrate" msg)
+
+                                                                _ ->
+                                                                    Expect.fail "Expected GenericError for missing migrations table"
+                                                        )
+                                                )
+                                        )
+                                    ]
+                            )
+                    )
+            )
+
+
+{-|-}
+tests : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
+tests fileSystemPermission permissions =
+    describe "All Sqlite.Migrate tests"
+        [ singleMigrationTests fileSystemPermission permissions
+        , sqliteErrorTests fileSystemPermission permissions
+        , localMigrationsEmptyErrorTests fileSystemPermission permissions
+        , moreRemoteThanLocalMigrationsErrorTests fileSystemPermission permissions
+        , emptyMigrationNameErrorTests fileSystemPermission permissions
+        , conflictingMigrationNameErrorTests fileSystemPermission permissions
+        , whitespaceMigrationNameErrorTests fileSystemPermission permissions
+        , whitespaceConflictingMigrationNameErrorTests fileSystemPermission permissions
+        , emptyMigrationStatementsErrorTests fileSystemPermission permissions
+        , migrationStatementMentionsMigrationTableErrorTests fileSystemPermission permissions
+        , migrationChainDivergedErrorTests fileSystemPermission permissions
+        , migrationHashesDoNotMatchErrorTests fileSystemPermission permissions
+        , migrationHashDecodingFailedErrorTests fileSystemPermission permissions
+        , rollbackOnFailureTests fileSystemPermission permissions
+        , rerunIsNoOpTests fileSystemPermission permissions
+        , whitespaceInStatementsIgnoredTests fileSystemPermission permissions
+        , survivesDatabaseReopenTests fileSystemPermission permissions
+        , migrationsApplyInDeclarationOrderTests fileSystemPermission permissions
+        , previewFreshDatabaseTests fileSystemPermission permissions
+        , previewWithOneAppliedTests fileSystemPermission permissions
+        , previewAppliedOrderTests fileSystemPermission permissions
+        , previewLeavesStateUnchangedTests fileSystemPermission permissions
+        , previewSurfacesDivergedChainErrorTests fileSystemPermission permissions
+        , previewWithEmptyMigrationsErrorTests fileSystemPermission permissions
+        , migrateInsideCallerTransactionTests fileSystemPermission permissions
+        , previewInsideCallerTransactionTests fileSystemPermission permissions
+        ]
+
+
+{-|-}
+main : Test.Runner.Effectful.Program a
+main =
+    Node.defineSimpleProgram
+        (\env ->
+            Init.await FileSystem.initialize
+                (\fileSystemPermission ->
+                    await "Get secure context for Crypto functions" Crypto.getSecureContext
+                        (\secureContext ->
+                            tests fileSystemPermission
+                                { secureContext = secureContext }
+                        )
+                        |> Test.Runner.Effectful.run env
+                )
+        )
+
+
+
+-- Utilities
+
+
+{-|-}
+type alias MigrationRow =
+    { name : String
+    , migrationHash : String
+    , chainHash : String
+    , appliedAt : Int 
+    }
+
+
+{-|-}
+getAllMigrationsQuery : Sqlite.Query MigrationRow
+getAllMigrationsQuery =
+    let
+        statement =
+            """
+            SELECT name, migration_hash, chain_hash, applied_at FROM __gren_sqlite_migrate ORDER BY rowid;
+            """
+    in
+    { query = statement
+    , parameters = []
+    , rowDecoder =
+        Sqlite.Decode.Row.column "name" Sqlite.Decode.string
+            (\name ->
+                Sqlite.Decode.Row.column "migration_hash" Sqlite.Decode.string
+                    (\migrationHash ->
+                        Sqlite.Decode.Row.column "chain_hash" Sqlite.Decode.string
+                            (\chainHash ->
+                                Sqlite.Decode.Row.column "applied_at" Sqlite.Decode.int
+                                    (\appliedAt ->
+                                        Sqlite.Decode.Row.succeed
+                                            { name = name
+                                            , migrationHash = migrationHash
+                                            , chainHash = chainHash
+                                            , appliedAt = appliedAt
+                                            }
+                                    )
+                            )
+                    )
+            )
+    }

@@ -1,0 +1,881 @@
+module Sqlite.Migrate exposing ( Migration, Permissions, Error(..), Preview, migrate, preview )
+
+{-| Apply or preview migrations to a SQLite database.
+
+@docs Permissions
+
+@docs Migration
+
+## Run migrations
+
+@docs migrate
+
+## Preview migrations
+
+@docs Preview, preview
+
+## Errors
+
+@docs Error
+-}
+
+import Base64.Encode
+import Base64.Decode
+import Bytes exposing ( Bytes )
+import Crypto
+import Dict exposing ( Dict )
+import Set
+import Sqlite
+import Sqlite.Encode
+import Sqlite.Encode.Row
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Task exposing ( Task )
+import Time
+
+
+{-| A single migration represented as a name and set of SQL statements to be applied
+to the database.
+
+All strings in `statements` _must_ contain a single SQL statement. Additional
+statements in the same string are silently ignored, will not be executed when the
+migration happens, and do not throw errors. This is the default behavior of the
+`Sqlite.execute` function which this package uses to apply the given migrations
+to the database. However, these additional statements will be used to calculate the
+hash of this migration. As a result, once applied to a database, these no-op statements
+will need to be kept around or else corrupt the hash chain.
+
+While this is not necessarily going to corrupt your database, it may make it difficult
+to understand the state of a database by looking at its migrations or may cause your
+runtime code to expect a specific database schema that isn't accurate. You've been warned!
+
+For example, if you want to create two tables in a single migration, it might look
+something like this:
+
+    { name = "Add tables"
+    , statements =
+        [ "CREATE TABLE IF NOT EXISTS menu (id INTEGER)"
+        , "CREATE TABLE IF NOT EXISTS dishes (id INTEGER)"
+        ]
+    }
+
+Do not do this:
+
+    { name = "Add tables"
+    , statements =
+        [ "CREATE TABLE IF NOT EXISTS menu (id INTEGER); CREATE TABLE IF NOT EXISTS dishes (id INTEGER)"
+        ]
+    }
+
+-}
+type alias Migration =
+    { name : String
+    , statements : Array String
+    }
+
+
+{-| The permissions needed to run migrations.
+
+- `secureContext` is used to hash migrations and create hash chains.
+-}
+type alias Permissions =
+    { secureContext : Crypto.SecureContext
+    }
+
+
+{-| The schema for the migrations table inserted into the database. This
+schema has the following columns:
+
+- The `name` column stores the name of the migration. This is only for making
+migrations easier to reference and do not affect hashes.
+- The `migration_hash` column is the hash of the given migration.
+- The `chain_hash` column is the hash of the migration chain.
+- The `applied_at` column is the posix time that the migration is applied. Like
+the `name`, this is only for reference and does not affect the calculating new
+migrations.
+-}
+migrationsTableSchema : { statement : String, parameters : Array Sqlite.Encode.Row.Value }
+migrationsTableSchema =
+    let
+        statement =
+            """
+            CREATE TABLE IF NOT EXISTS __gren_sqlite_migrate (
+                name TEXT NOT NULL,
+                migration_hash TEXT NOT NULL,
+                chain_hash TEXT NOT NULL UNIQUE,
+                applied_at INTEGER NOT NULL
+            );
+            """
+    in
+    { statement = statement
+    , parameters = []
+    }
+
+
+{-|-}
+type alias InsertAppliedSqlParams =
+    { name : String
+    , migrationHash : String
+    , chainHash : String
+    , appliedAt : Int
+    }
+
+
+{-|-}
+insertAppliedSql : InsertAppliedSqlParams -> { statement : String, parameters : Array Sqlite.Encode.Row.Value }
+insertAppliedSql params =
+    let
+        statement =
+            """
+            INSERT INTO __gren_sqlite_migrate (name, migration_hash, chain_hash, applied_at)
+            VALUES (:name, :migration_hash, :chain_hash, :applied_at);
+            """
+    in
+    { statement = statement
+    , parameters =
+        [ Sqlite.Encode.Row.column "name" <| Sqlite.Encode.string params.name
+        , Sqlite.Encode.Row.column "migration_hash" <| Sqlite.Encode.string params.migrationHash
+        , Sqlite.Encode.Row.column "chain_hash" <| Sqlite.Encode.string params.chainHash
+        , Sqlite.Encode.Row.column "applied_at" <| Sqlite.Encode.int params.appliedAt
+        ]
+    }
+
+
+{-| Normalise a statement before hashing so cosmetic differences (Windows CRLF
+line endings, trailing newlines, leading/trailing whitespace) don't change its
+hash. The actual SQL sent to SQLite is never normalised — only the bytes fed
+into the chain hash.
+-}
+normalizeStatementForHashing : String -> String
+normalizeStatementForHashing statement =
+    statement
+        |> String.replace "\r\n" "\n"
+        |> String.replace "\r" "\n"
+        |> String.trim
+
+
+{-| Hash a single `Migration`. Each statement is normalised (see
+`normalizeStatementForHashing`) and hashed individually; the resulting
+`Array Bytes` is flattened and hashed again to produce the migration hash.
+-}
+hashMigration : Crypto.SecureContext -> Migration -> Task Error Bytes
+hashMigration secureContext { statements } =
+    statements
+        |> Array.foldl
+            (\statement ->
+                Task.andThen (\arr ->
+                    normalizeStatementForHashing statement
+                        |> Bytes.fromString
+                        |> Crypto.digest secureContext Crypto.Sha256
+                        |> Task.andThen (\bytes ->
+                            Array.pushLast bytes arr
+                                |> Task.succeed
+                            )
+                    )
+            )
+            (Task.succeed [])
+        |> Task.map Bytes.flatten
+        |> Task.andThen (Crypto.digest secureContext Crypto.Sha256)
+
+
+{-|-}
+computeChainHash :
+    Crypto.SecureContext
+    -> { prev : Bytes, migration : Migration }
+    -> Task Error { hashChain : Bytes, migrationHash : Bytes }
+computeChainHash secureContext { prev, migration } =
+    hashMigration secureContext migration
+        |> Task.andThen (\migrationHash ->
+            Array.singleton migrationHash
+                |> Array.pushFirst prev
+                |> Bytes.flatten
+                |> Crypto.digest secureContext Crypto.Sha256
+                |> Task.map (\hashChainBytes ->
+                    { hashChain = hashChainBytes
+                    , migrationHash = migrationHash
+                    }
+                )
+        )
+
+
+{-| Whether the pipeline should actually apply migrations or stop short and report
+what it would have done.
+-}
+type Mode
+    = Run
+    | Preview
+
+
+{-| The name of the savepoint that is used in every `migrate` and `preview` call.
+-}
+savepointName : String
+savepointName =
+    "gren_sqlite_migrate"
+
+
+{-| Discard everything the savepoint captured, then the savepoint itself, in a
+single script so that nothing can interleave between the two statements.
+-}
+discardSavepointScript : String
+discardSavepointScript =
+    "ROLLBACK TO SAVEPOINT " ++ savepointName ++ "; RELEASE SAVEPOINT " ++ savepointName
+
+
+{-| Run a task inside a savepoint, RELEASING it on success and discarding it on
+failure.
+-}
+inCommittingSavepoint : Sqlite.Database -> Task Error a -> Task Error a
+inCommittingSavepoint database task =
+    Sqlite.executeScript database ("SAVEPOINT " ++ savepointName)
+        |> Task.mapError SqliteError
+        |> Task.andThen (\_ -> task)
+        |> Task.onError (\err ->
+            Sqlite.executeScript database discardSavepointScript
+                |> Task.mapError SqliteError
+                |> Task.andThen (\_ -> Task.fail err)
+        )
+        |> Task.andThen (\result ->
+            Sqlite.executeScript database ("RELEASE SAVEPOINT " ++ savepointName)
+                |> Task.mapError SqliteError
+                |> Task.andThen (\_ -> Task.succeed result)
+        )
+
+
+{-| Run a task inside a savepoint that is always discarded.
+-}
+inRolledBackSavepoint : Sqlite.Database -> Task Error a -> Task Error a
+inRolledBackSavepoint database task =
+    Sqlite.executeScript database ("SAVEPOINT " ++ savepointName)
+        |> Task.mapError SqliteError
+        |> Task.andThen (\_ -> task)
+        |> Task.onError (\err ->
+            Sqlite.executeScript database discardSavepointScript
+                |> Task.mapError SqliteError
+                |> Task.andThen (\_ -> Task.fail err)
+        )
+        |> Task.andThen (\result ->
+            Sqlite.executeScript database discardSavepointScript
+                |> Task.mapError SqliteError
+                |> Task.andThen (\_ -> Task.succeed result)
+        )
+
+
+{-|-}
+type alias MigrationRow =
+    { name : String
+    , migrationHash : String
+    , chainHash : String
+    , appliedAt : Int
+    }
+
+
+{-|-}
+getAllMigrationsQuery : Sqlite.Query MigrationRow
+getAllMigrationsQuery =
+    let
+        statement =
+            """
+            SELECT name, migration_hash, chain_hash, applied_at FROM __gren_sqlite_migrate ORDER BY rowid;
+            """
+    in
+    { query = statement
+    , parameters = []
+    , rowDecoder =
+        Sqlite.Decode.Row.column "name" Sqlite.Decode.string <| \name ->
+        Sqlite.Decode.Row.column "migration_hash" Sqlite.Decode.string <| \migrationHash ->
+        Sqlite.Decode.Row.column "chain_hash" Sqlite.Decode.string <| \chainHash ->
+        Sqlite.Decode.Row.column "applied_at" Sqlite.Decode.int <| \appliedAt ->
+            Sqlite.Decode.Row.succeed
+                { name = name
+                , migrationHash = migrationHash
+                , chainHash = chainHash
+                , appliedAt = appliedAt
+                }
+    }
+
+
+{-|-}
+type alias PendingMigration =
+    { name : String
+    , statements : Array String
+    , migrationHash : String
+    , chainHash : String
+    , appliedAt : Int
+    }
+
+
+{-| Initial state. Responsible for getting the migrations from the database.
+-}
+type alias InitState =
+    { database : Sqlite.Database
+    , localMigrations : Array Migration -- All of the migrations in the codebase
+    }
+
+
+{-| Checks the migrations retrieved from the database for correctness.
+-}
+type alias CheckState =
+    { database : Sqlite.Database
+    , localMigrations : Array Migration
+    , remoteMigrations : Dict String MigrationRow -- Migrations from the database; key is chain hash
+    }
+
+
+{-| Processes migrations. Iterates through all of the local migrations, re-creating
+their hashes. Tries to find a matching migration for each local migration. Does not
+actually apply migrations, but builds a pending array of migrations to then apply to the database
+-}
+type alias ProcessState =
+    { database : Sqlite.Database
+    , localMigrations : Array Migration
+    , chainHashAcc : Bytes
+    , remoteMigrations : Dict String MigrationRow -- Migrations from the database; key is chain hash
+    , appliedMigrations : Array MigrationRow -- init empty; these are kept around for reporting
+    , pendingMigrations : Array PendingMigration
+    }
+
+
+{-| Applies all `pendingMigrations` and moves them to the `appliedMigrations` array.
+
+A "dry run" does not apply these migrations, but instead builds this as an example
+and reports back to the user what will be applied and what has already been applied.
+-}
+type alias ApplyState =
+    { database : Sqlite.Database
+    , appliedMigrations : Array MigrationRow
+    , pendingMigrations : Array PendingMigration
+    }
+
+
+{-| Terminal state. Carries the database (so callers can keep using it) along with
+a report of every migration that was already applied or just applied.
+-}
+type alias CompleteState =
+    { database : Sqlite.Database
+    , appliedMigrations : Array MigrationRow
+    }
+
+
+{-|-}
+type State
+    = Init InitState -- Start the migration process
+    | Check CheckState -- Initial checks on migrations and the results of the table
+    | Process ProcessState -- Final review
+    | Apply ApplyState -- Apply migrations (or produce a preview of them)
+    | Complete CompleteState -- The migration process is complete
+
+
+{-| Errors that can happen when running or previewing a migration.
+
+- `SqliteError` is an error with the Gren SQLite library. This is most likely to happen due
+to problems with the given SQL statements in a migration.
+- `LocalMigrationsEmptyError` is when the `Array Migrations` asked for by the `preview`
+and `migrate` functions is empty (`[]`).
+- `MoreRemoteThanLocalMigrationsError` is when there are more applied migrations in the
+database than there are in a set of migrations. This doesn't make sense! The local
+migrations given to the `migrate` or `preview` functions must always be equal to or greater
+than the migrations already applied to the database.
+- `EmptyMigrationNameError` is when a migration's name is empty or contains only whitespace.
+Each migration must have a non-empty name.
+- `ConflictingMigrationNameError` is when two or more migrations share the same name (after
+trimming surrounding whitespace). Each migration name must be unique.
+- `EmptyMigrationStatementsError` is when the given `statements` in a `Migration` are
+empty (`[]`).
+- `MigrationStatementMentionsMigrationTableError` is when one or more of the `statements` in
+a migration contain an exact reference to the `__gren_sqlite_migrate` table. While unlikely
+to happen, this prevents accidentally altering the migrations ledger data which would
+cause problems!
+- `MigrationHashesDoNotMatchError` is when a migration hash does not match a hash in the
+database. This points towards a migration having been altered from when it was first applied
+to the database.
+- `MigrationChainDivergedError` is when the calculated hash chain in a set of migrations does
+not align with the hash chain in the database. This points to the order of migrations previously
+applied being changed.
+- `MigrationHashDecodingFailedError` is when there is a problem with decoding the base64 encoded
+strings for migration and chain hashes in the database. This points towards data corruption,
+where the data on the database may have been changed outside of the functions in this module.
+-}
+type Error
+    = SqliteError Sqlite.Error -- An error returned by the underlying SQLite library
+    | LocalMigrationsEmptyError -- No migrations were provided to `migrate`
+    | MoreRemoteThanLocalMigrationsError -- There are more remote migrations applied on the database than local migrations
+    | EmptyMigrationNameError -- A migration was provided with an empty or whitespace-only name
+    | ConflictingMigrationNameError String -- Two migrations have the same name (after trimming whitespace)
+    | EmptyMigrationStatementsError String -- A migration has no statements, or its statements are empty/whitespace-only after trimming
+    | MigrationStatementMentionsMigrationTableError String -- A migration statement references the internal migrations table, which is not allowed
+    | MigrationHashesDoNotMatchError String -- A migration's contents have changed since it was applied to the database (chain hash matched, migration hash did not)
+    | MigrationChainDivergedError String -- A local migration's chain hash was not found in the database, but other remote migrations remain — the local chain has diverged from the recorded one
+    | MigrationHashDecodingFailedError -- A migration hash or chain hash stored in the database could not be decoded — the migrations table may be corrupted
+
+
+{-|-}
+init : InitState -> Task Error State
+init state =
+    let
+        { database, localMigrations } =
+            state
+    in
+    Sqlite.execute database migrationsTableSchema
+        |> Task.mapError SqliteError
+        |> Task.andThen (\_ ->
+            Sqlite.getAll database getAllMigrationsQuery
+                |> Task.mapError SqliteError
+        )
+        |> Task.map
+            (Array.foldl
+                (\migration ->
+                    Dict.set migration.chainHash migration
+                )
+                Dict.empty
+            )
+        |> Task.andThen (\remoteMigrations ->
+            Task.succeed
+                (Check
+                    { database = database
+                    , localMigrations = localMigrations
+                    , remoteMigrations = remoteMigrations
+                    }
+                )
+        )
+
+
+{-| Check to see if the `localMigrations` array is empty or not. Fails if the
+array is empty with an appropriate error. Succeeds otherwise.
+
+This prevents the migration process from running at all if there are no
+migrations to run!
+-}
+checkLocalMigrationsPopulated : CheckState -> Task Error CheckState
+checkLocalMigrationsPopulated state =
+    if Array.isEmpty state.localMigrations then
+        Task.fail LocalMigrationsEmptyError
+
+
+    else
+        Task.succeed state
+
+
+{-| Check to see if the local migrations length is greater than or equal to the
+number of remote migrations. If there are more remote migrations than local
+migrations, something has gone wrong.
+-}
+checkLocalMigrationSizeComparedToRemote : CheckState -> Task Error CheckState
+checkLocalMigrationSizeComparedToRemote state =
+    if Array.length state.localMigrations >= Dict.count state.remoteMigrations then
+        Task.succeed state
+
+    else
+        Task.fail MoreRemoteThanLocalMigrationsError
+
+
+{-| Checks to make sure the local migrations have names and those names are unique.
+It's preferred to have unique names for migrations to make each migration easier to
+understand in the future.
+-}
+checkLocalMigrations : CheckState -> Task Error CheckState
+checkLocalMigrations state =
+    let
+        containsEmptyStrings =
+            Array.foldl
+                (\string acc ->
+                    if acc then
+                        acc
+
+                    else if String.isEmpty (String.trim string) then
+                        True
+
+                    else
+                        False
+                )
+                False
+
+        containsAuditTableReference =
+            Array.foldl
+                (\string acc ->
+                    if acc then
+                        acc
+
+                    else
+                        String.contains "__gren_sqlite_migrate" (String.toLower string)
+                )
+                False
+    in
+    state.localMigrations
+        |> Array.foldl
+            (\migration ->
+                Task.andThen
+                    (\namesSet ->
+                        let
+                            name =
+                                String.trim migration.name
+                        in
+                        if String.isEmpty name then
+                            Task.fail EmptyMigrationNameError
+
+                        else if Set.member name namesSet then
+                            Task.fail (ConflictingMigrationNameError name)
+
+                        else if Array.isEmpty migration.statements then
+                            Task.fail (EmptyMigrationStatementsError name)
+
+                        else if containsEmptyStrings migration.statements then
+                            Task.fail (EmptyMigrationStatementsError name)
+
+                        else if containsAuditTableReference migration.statements then
+                            Task.fail (MigrationStatementMentionsMigrationTableError name)
+
+                        else
+                            Task.succeed (Set.set name namesSet)
+                    )
+            )
+            (Task.succeed Set.empty)
+        |> Task.andThen (\_ -> Task.succeed state)
+
+
+{-| Checks to make sure the chain hash and the migration hash of a migration can
+successfully be decoded from the expected base64 encoding. If they cannot be decoded,
+any attempt to run a migration will fail.
+-}
+checkRemoteCorruption : CheckState -> Task Error CheckState
+checkRemoteCorruption state =
+    let
+        base64Decodes value =
+            Base64.Decode.bytes value
+                |> Result.toMaybe
+    in
+    state.remoteMigrations
+        |> Dict.foldl
+            (\migrationChainHash migration acc ->
+                when base64Decodes migrationChainHash is
+                    Just _ ->
+                        when base64Decodes migration.migrationHash is
+                            Just _ ->
+                                acc
+
+                            Nothing ->
+                                Task.fail MigrationHashDecodingFailedError
+
+                    Nothing ->
+                        Task.fail MigrationHashDecodingFailedError
+            )
+            (Task.succeed state)
+
+
+{-| Pre-expensive calculation checks on the local and remote migrations. Handles
+initial, simple, checks before expensive hashing operations are used to determine
+the integrity of the migrations.
+-}
+check : CheckState -> Task Error State
+check state =
+    checkLocalMigrationsPopulated state
+        |> Task.andThen checkLocalMigrationSizeComparedToRemote
+        |> Task.andThen checkLocalMigrations
+        |> Task.andThen checkRemoteCorruption
+        |> Task.andThen
+            (\checkedState ->
+                Task.succeed
+                    (Process
+                        { database = checkedState.database
+                        , localMigrations = checkedState.localMigrations
+                        , remoteMigrations = checkedState.remoteMigrations
+                        , appliedMigrations = []
+                        , pendingMigrations = []
+                        , chainHashAcc = Bytes.empty
+                        }
+                    )
+            )
+
+
+{-|-}
+process : Permissions -> ProcessState -> Task Error State
+process permissions state =
+    let
+        { database, chainHashAcc, localMigrations, remoteMigrations, appliedMigrations, pendingMigrations } =
+            state
+
+        { secureContext } =
+            permissions
+    in
+    when Array.popFirst localMigrations is
+        Just { first = migration, rest = rest } ->
+            computeChainHash secureContext
+                { prev = chainHashAcc
+                , migration = migration
+                }
+                |> Task.andThen
+                    (\{ hashChain, migrationHash } ->
+                        let
+                            encodeBytes =
+                                Base64.Encode.bytes >> Base64.Encode.encode
+
+                            migrationChainHash =
+                                encodeBytes hashChain
+
+                            migrationHashAsBase64 =
+                                encodeBytes migrationHash
+                        in
+                        -- Try to find the current migration chain hash in remote migrations
+                        when Dict.get migrationChainHash remoteMigrations is
+                            Just foundMigration ->
+                                -- If found, check the migration hash, too
+                                if foundMigration.migrationHash == migrationHashAsBase64 then
+                                    -- If successful,
+                                    process
+                                        permissions
+                                        { database = database
+                                        , localMigrations = rest
+                                        , chainHashAcc = hashChain
+                                        , remoteMigrations = Dict.remove migrationChainHash remoteMigrations
+                                        , appliedMigrations = Array.pushLast foundMigration appliedMigrations
+                                        , pendingMigrations = pendingMigrations
+                                        }
+
+                                else
+                                    Task.fail (MigrationHashesDoNotMatchError foundMigration.name)
+
+                            Nothing ->
+                                -- If not found _and_ there are not more remote migrations, add to apply log
+                                if Dict.isEmpty remoteMigrations then
+                                    process
+                                        permissions
+                                        { database = database
+                                        , localMigrations = rest
+                                        , chainHashAcc = hashChain
+                                        , remoteMigrations = remoteMigrations
+                                        , appliedMigrations = appliedMigrations
+                                        , pendingMigrations =
+                                            Array.pushLast
+                                                { name = migration.name
+                                                , statements = migration.statements
+                                                , migrationHash = migrationHashAsBase64
+                                                , chainHash = migrationChainHash
+                                                , appliedAt = 0
+                                                }
+                                                pendingMigrations
+                                        }
+
+                                else
+                                    Task.fail (MigrationChainDivergedError migration.name)
+                    )
+
+        Nothing ->
+            Task.succeed
+                (Apply
+                    { database = database
+                    , appliedMigrations = appliedMigrations
+                    , pendingMigrations = pendingMigrations
+                    }
+                )
+
+
+{-| Driver for the `Apply` step. Pops the next pending migration, delegates
+the per-migration work to `applyOnePending`, and recurses. When no pending
+migrations remain, transitions to the `Complete` state.
+-}
+apply : Permissions -> ApplyState -> Task Error State
+apply permissions state =
+    when Array.popFirst state.pendingMigrations is
+        Nothing ->
+            Task.succeed
+                (Complete
+                    { database = state.database
+                    , appliedMigrations = state.appliedMigrations
+                    }
+                )
+
+        Just { first = pending, rest = rest } ->
+            applyPendingMigration { state | pendingMigrations = rest } pending
+                |> Task.andThen (apply permissions)
+
+
+{-| Apply a single pending migration: stamp the time, run its statements, then
+record the row in
+`__gren_sqlite_migrate` and move it into `appliedMigrations`. Returns the
+updated state.
+-}
+applyPendingMigration : ApplyState -> PendingMigration -> Task Error ApplyState
+applyPendingMigration state pending =
+    Time.now
+        |> Task.andThen
+            (\now ->
+                let
+                    appliedAt =
+                        Time.posixToMillis now
+                in
+                runMigrationStatements state.database pending.statements
+                    |> Task.andThen
+                        (\_ -> recordMigrationApplied state.database pending appliedAt)
+                    |> Task.map
+                        (\_ ->
+                            { state
+                                | appliedMigrations =
+                                    Array.pushLast
+                                        { name = pending.name
+                                        , migrationHash = pending.migrationHash
+                                        , chainHash = pending.chainHash
+                                        , appliedAt = appliedAt
+                                        }
+                                        state.appliedMigrations
+                            }
+                        )
+            )
+
+
+{-| Run each statement of a pending migration in order against the database.
+-}
+runMigrationStatements : Sqlite.Database -> Array String -> Task Error {}
+runMigrationStatements database statements =
+    statements
+        |> Array.foldl
+            (\statement ->
+                Task.andThen
+                    (\_ ->
+                        Sqlite.execute database
+                            { statement = statement
+                            , parameters = []
+                            }
+                            |> Task.mapError SqliteError
+                            |> Task.andThen (\_ -> Task.succeed database)
+                    )
+            )
+            (Task.succeed database)
+        |> Task.map (\_ -> {})
+
+
+{-| Insert a row into `__gren_sqlite_migrate` recording that `pending` was
+applied at `appliedAt`.
+-}
+recordMigrationApplied : Sqlite.Database -> PendingMigration -> Int -> Task Error {}
+recordMigrationApplied database pending appliedAt =
+    Sqlite.execute database
+        (insertAppliedSql
+            { name = pending.name
+            , migrationHash = pending.migrationHash
+            , chainHash = pending.chainHash
+            , appliedAt = appliedAt
+            }
+        )
+        |> Task.mapError SqliteError
+        |> Task.map (\_ -> {})
+
+
+{-|-}
+migrateHelper : Mode -> Permissions -> State -> Task Error State
+migrateHelper mode permissions migrateState =
+    when migrateState is
+        Init state ->
+            Task.andThen (migrateHelper mode permissions) (init state)
+
+        Check state ->
+            Task.andThen (migrateHelper mode permissions) (check state)
+
+        Process state ->
+            Task.andThen (migrateHelper mode permissions) (process permissions state)
+
+        Apply state ->
+            when mode is
+                Run ->
+                    Task.andThen (migrateHelper mode permissions) (apply permissions state)
+
+                Preview ->
+                    Task.succeed (Apply state)
+
+        Complete state ->
+            Task.succeed (Complete state)
+
+
+{-| Run a set of given migrations (`Array Migration`) in order on the given
+database. This will:
+
+1. Open a savepoint, making this function safe to call from inside an
+existing SQLite transaction.
+2. Create a new `__gren_sqlite_migrate` table if it does not already exist.
+3. Retrieve any existing migrations from the `__gren_sqlite_migrate` table.
+4. Check the given migrations to ensure there aren't any issues that will
+cause problems or corruption.
+5. Check the given migration hash chain against the databases hash chain,
+ensuring everything checks out and there are no deviations. This also builds
+a list of migrations that still need to be applied.
+6. Applies the still pending migrations and updates the `__gren_sqlite_migrate`
+table with a record of those applied.
+
+While the SQL savepoint helps ensure the SQL runs without issue (and properly
+rolls back all changes if necessary), it's highly recommended that you run this
+function completely separate from other SQL.
+-}
+migrate : Sqlite.Database -> Permissions -> Array Migration -> Task Error Sqlite.Database
+migrate openedDatabase permissions migrations =
+    inCommittingSavepoint openedDatabase
+        (migrateHelper
+            Run
+            permissions
+            (Init
+                { database = openedDatabase
+                , localMigrations = migrations
+                }
+            )
+        )
+        |> Task.map (\_ -> openedDatabase)
+
+
+{-| The result of running the `preview` function.
+
+- `applied` are the migrations the database already records as applied, in
+order.
+- `pending` are the migrations that would be applied if `migrate` were to be
+called with the same arguments, in order.
+-}
+type alias Preview =
+    { applied : Array { name : String, migrationHash : String, chainHash : String, appliedAt : Int }
+    , pending : Array { name : String, migrationHash : String, chainHash : String }
+    }
+
+
+{-| Run the migration pipeline up to (but not including) applying any pending
+migrations. Instead of running those migrations, produce a `Preview` record.
+-}
+preview : Sqlite.Database -> Permissions -> Array Migration -> Task Error Preview
+preview openedDatabase permissions migrations =
+    inRolledBackSavepoint openedDatabase
+        (migrateHelper
+            Preview
+            permissions
+            (Init
+                { database = openedDatabase
+                , localMigrations = migrations
+                }
+            )
+        )
+        |> Task.map stateToPreview
+
+
+{-| Project a terminal `State` into a public `Preview`. In `Preview` mode the
+pipeline always lands on `Apply`.
+-}
+stateToPreview : State -> Preview
+stateToPreview state =
+    let
+        toApplied row =
+            { name = row.name
+            , migrationHash = row.migrationHash
+            , chainHash = row.chainHash
+            , appliedAt = row.appliedAt
+            }
+
+        toPending p =
+            { name = p.name
+            , migrationHash = p.migrationHash
+            , chainHash = p.chainHash
+            }
+    in
+    when state is
+        Apply { appliedMigrations, pendingMigrations } ->
+            { applied = Array.map toApplied appliedMigrations
+            , pending = pendingMigrations |> Array.map toPending
+            }
+
+        -- Unreachable: `LocalMigrationsEmptyError` rejects empty local migrations in
+        -- `init`, so by the time we reach `Apply` at least one of `appliedMigrations`
+        -- / `pendingMigrations` is non-empty.
+        _ ->
+            { applied = [], pending = [] }
